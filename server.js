@@ -3,146 +3,100 @@ import cors from 'cors';
 import bodyParser from 'body-parser';
 import axios from 'axios';
 import dotenv from 'dotenv';
-import multer from 'multer';
-import path from 'path';
-import fs from 'fs';
-import { fileURLToPath } from 'url';
 
 dotenv.config();
 
 const app = express();
 const PORT = process.env.PORT || 3000;
 
-// ตั้งค่าสำหรับใช้งาน __dirname ใน ES Module
-const __filename = fileURLToPath(import.meta.url);
-const __dirname = path.dirname(__filename);
-
-// ตรวจสอบและสร้างโฟลเดอร์สำหรับเก็บรูปสลิป
-const uploadDir = path.join(__dirname, 'uploads');
-if (!fs.existsSync(uploadDir)){
-    fs.mkdirSync(uploadDir, { recursive: true });
-}
-
-// ตั้งค่า Multer สำหรับบันทึกไฟล์สลิป
-const storage = multer.diskStorage({
-  destination: (req, file, cb) => {
-    cb(null, uploadDir);
-  },
-  filename: (req, file, cb) => {
-    cb(null, Date.now() + path.extname(file.originalname));
-  }
-});
-const upload = multer({ storage: storage });
-
 // Middleware
 app.use(cors());
 app.use(bodyParser.json());
 app.use(bodyParser.urlencoded({ extended: true }));
 
-// เปิดให้เข้าถึงไฟล์ในโฟลเดอร์ uploads และโฟลเดอร์หน้าบ้าน public
-app.use('/uploads', express.static(uploadDir));
-app.use(express.static(path.join(__dirname, 'public')));
-
-//คลังเก็บข้อมูลคิวชั่วคราวใน RAM
+// In-memory storage (คลังเก็บข้อมูลคิวชั่วคราว)
 let queues = [];
 let queueCounter = 1;
 
+// LINE Configuration
 const LINE_CHANNEL_ACCESS_TOKEN = process.env.LINE_CHANNEL_ACCESS_TOKEN || '';
 
-// ============ ROUTE สำหรับเปิดหน้าเว็บ ============
-app.get('/', (req, res) => {
-  res.sendFile(path.join(__dirname, 'public', 'index.html'));
-});
-
-app.get('/admin-dashboard', (req, res) => {
-  res.sendFile(path.join(__dirname, 'public', 'admin.html'));
-});
-
-// ============ API ROUTES ============
-
-// ดึงข้อมูลคิวทั้งหมด
+// 1. ดึงข้อมูลคิวทั้งหมดไปโชว์หน้าเว็บ
 app.get('/api/queues', (req, res) => {
   res.json({ queues });
 });
 
-// จองคิวใหม่ (รองรับการอัปโหลดไฟล์สลิป)
-app.post('/api/book-queue', upload.single('slip'), (req, res) => {
-  const { type, displayName, userId, pictureUrl, scheduledDate, scheduledTime, duration } = req.body;
-  const slipFile = req.file;
+// 2. รับจองคิวใหม่จากหน้าบ้าน
+app.post('/api/book-queue', (req, res) => {
+  const { displayName, userId, type, scheduledDate, scheduledTime, duration } = req.body;
 
   if (!displayName) {
-    return res.status(400).json({ error: 'ไม่พบข้อมูลโปรไฟล์ LINE' });
-  }
-  if (!slipFile) {
-    return res.status(400).json({ error: 'กรุณาอัปโหลดรูปภาพสลิปเงินโอน' });
+    return res.status(400).json({ error: 'ไม่พบชื่อผู้ใช้งาน LINE' });
   }
 
   const newQueue = {
-    id: Date.now(),
-    queueNumber: queueCounter++,
+    id: queueCounter++,
+    queueNumber: queues.length + 1,
     displayName,
-    userId: userId || null,
-    pictureUrl: pictureUrl || null,
-    type, 
-    duration: duration || null,
-    scheduledDate: scheduledDate || null,
-    scheduledTime: scheduledTime || null,
-    slipUrl: `/uploads/${slipFile.filename}`,
-    status: 'waiting', 
+    userId,
+    type, // 'walkin' หรือ 'phone'
+    scheduledDate: scheduledDate || '-',
+    scheduledTime: scheduledTime || '-',
+    duration: duration || '-',
+    status: 'waiting', // waiting (รอ), called (เรียกแล้ว), completed (เสร็จสิ้น)
     bookingTime: new Date(),
   };
 
   queues.push(newQueue);
 
-  // ส่ง Push Message แจ้งเตือนลูกค้าผ่าน LINE ทันทีเมื่อจองเสร็จ
-  if (LINE_CHANNEL_ACCESS_TOKEN && userId) {
-    sendLinePushNotification(userId, `🎉 คุณ ${displayName} จองคิวสำเร็จแล้ว!\nคิวของคุณคือลำดับที่ ${newQueue.queueNumber}\nประเภท: ${type === 'phone' ? 'นัดหมายทางโทรศัพท์' : 'คิวพิมพ์ปกติ'}`);
+  // ส่งแจ้งเตือนเข้า LINE OA ร้านค้าทันทีที่มีคนจอง
+  if (LINE_CHANNEL_ACCESS_TOKEN) {
+    const typeText = type === 'walkin' ? 'พิมพ์คุย (ปกติ)' : 'โทรคุย (นัดเวลา)';
+    sendLineNotification(`📢 มีการจองคิวใหม่เข้ามา!\n👤 คุณ: ${displayName}\n🎫 คิวลำดับที่: ${newQueue.queueNumber}\n📦 ประเภท: ${typeText}\n⏰ เวลานัด: ${newQueue.scheduledDate} พ้นเวลา ${newQueue.scheduledTime}`);
   }
 
   res.json({ success: true, queue: newQueue });
 });
 
-// แอดมินเรียกคิว
+// 3. ปุ่มกดเรียกคิว (สำหรับแอดมิน)
 app.post('/api/call-queue/:id', (req, res) => {
   const queue = queues.find(q => q.id === parseInt(req.params.id));
   if (!queue) {
-    return res.status(404).json({ error: 'ไม่พบข้อมูลคิวดังกล่าว' });
+    return res.status(404).json({ error: 'ไม่พบข้อมูลคิวนี้' });
   }
 
   queue.status = 'called';
 
-  if (LINE_CHANNEL_ACCESS_TOKEN && queue.userId) {
-    sendLinePushNotification(queue.userId, `📢 ถึงคิวลำดับที่ ${queue.queueNumber} ของคุณแล้วค่ะ! รบกวนเตรียมพร้อมรับคำทำนายได้เลยนะคะ 🔮`);
+  // แจ้งเตือนบอกลูกค้าผ่าน LINE OA
+  if (LINE_CHANNEL_ACCESS_TOKEN) {
+    sendLineNotification(`📢 ถึงคิวของคุณแล้วครับ!\n🎫 ลำดับคิวที่: ${queue.queueNumber} (${queue.displayName})\n🔮 แอดมินเรียกพบ โปรดเตรียมตัวเข้าดูดวงได้เลยครับ`);
   }
 
   res.json({ success: true, queue });
 });
 
-// แอดมินปิดคิว
+// 4. ปุ่มกดปิดคิวเมื่อดูเสร็จ (สำหรับแอดมิน)
 app.post('/api/complete-queue/:id', (req, res) => {
   const queue = queues.find(q => q.id === parseInt(req.params.id));
   if (!queue) {
-    return res.status(404).json({ error: 'ไม่พบข้อมูลคิวดังกล่าว' });
+    return res.status(404).json({ error: 'ไม่พบข้อมูลคิวนี้' });
   }
 
   queue.status = 'completed';
 
-  if (LINE_CHANNEL_ACCESS_TOKEN && queue.userId) {
-    sendLinePushNotification(queue.userId, `✅ คิวลำดับที่ ${queue.queueNumber} ได้รับการทำนายเสร็จสิ้นแล้ว ขอบพระคุณที่ใช้บริการณัฏฐ์ดวงดูค่ะ 🙏`);
+  if (LINE_CHANNEL_ACCESS_TOKEN) {
+    sendLineNotification(`✅ คิวที่ ${queue.queueNumber} (${queue.displayName}) ทำรายการเสร็จสิ้น\n🙏 ขอบพระคุณที่เลือกดูดวงกับณัฏฐ์ดวงดูครับ ขอให้เฮง ๆ รวย ๆ ครับ`);
   }
 
   res.json({ success: true, queue });
 });
 
-// ฟังก์ชันส่งข้อความหา LINE ส่วนบุคคล (Push Message)
-async function sendLinePushNotification(toUserId, messageText) {
+// ฟังก์ชันส่งบรอดแคสต์แจ้งเตือนเข้า LINE
+async function sendLineNotification(message) {
   try {
     await axios.post(
-      'https://api.line.biz/v2/bot/message/push',
-      { 
-        to: toUserId,
-        messages: [{ type: 'text', text: messageText }] 
-      },
+      'https://api.line.biz/v2/bot/message/broadcast',
+      { messages: [{ type: 'text', text: message }] },
       {
         headers: {
           'Authorization': `Bearer ${LINE_CHANNEL_ACCESS_TOKEN}`,
@@ -151,10 +105,15 @@ async function sendLinePushNotification(toUserId, messageText) {
       }
     );
   } catch (error) {
-    console.error('LINE Push Error:', error.response ? error.response.data : error.message);
+    console.error('Error sending LINE notification:', error.message);
   }
 }
 
+// ตรวจสอบสถานะระบบ
+app.get('/', (req, res) => {
+  res.json({ status: 'เซิร์ฟเวอร์ระบบจองคิวพร้อมทำงาน 100%' });
+});
+
 app.listen(PORT, () => {
-  console.log(`Server is running on port ${PORT}`);
+  console.log(`Server running on port ${PORT}`);
 });
