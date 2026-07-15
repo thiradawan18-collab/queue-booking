@@ -1,7 +1,7 @@
 {
-  "name": "queue-booking-backend",
+  "name": "queue-booking",
   "version": "1.0.0",
-  "description": "Queue Booking System Backend",
+  "description": "Queue Booking System",
   "main": "server.js",
   "type": "module",
   "scripts": {
